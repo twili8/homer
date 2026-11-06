@@ -185,16 +185,6 @@ its own thread and its `ExitProcess` import is redirected to
   recompiling the loader per generation.
 * There is no hosted debug build; the release loader is raw shellcode, so
   debug it by attaching to the host process.
-* DLL unhooking redirects only the three legacy PEB lists. The loader's
-  private index/hash tables are not rewritten, the fresh image's `DllMain`
-  is not called, and its TLS block is not initialised. It is intended to
-  give the loader clean code paths for API resolution, not to replace a
-  module in the process loader's bookkeeping.
-* Unhooking requires the target to be already loaded and present either in
-  `\KnownDlls` or at the path recorded in its LDR entry.
-* Operator passes are load-bearing loader code with no isolation: a pass that
-  crashes or hangs takes down the load. `PRE_JUMP` covers PE payloads only;
-  raw shellcode (`-T 2`) has no image and no jump point to hook.
 
 The reasoning behind the loader design, and the full `LoadLibrary` path it is
-derived from, is in `docs/rewriting-an-ntdll-compatible-usermode-loader.md`.
+derived from, is in [here](https://twili8.github.io/2026/11/05/ntdll.html)!
