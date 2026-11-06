@@ -5,7 +5,7 @@
  * fresh image of each requested DLL, binds its import table, and points the
  * loader's LDR_DATA_TABLE_ENTRY at the clean copy. The original dirty
  * mapping is never made writable/executable, so no +X protection transition
- * happens on the image the EDR instrumented.
+ * happens on the image the EDR instrumented. 
  *
  * Image source order:
  *   1. \KnownDlls\<name>          (shared section, no disk I/O)
@@ -17,7 +17,7 @@
  *
  * This is the full implementation, so deleting this file ships a loader
  * without unhooking. The DLL host build excludes it on purpose (repointing
- * LDR entries inside a foreign host corrupts the host).
+ * LDR entries inside a foreign host corrupts the host). 
  */
 
 #include "pass.h"
